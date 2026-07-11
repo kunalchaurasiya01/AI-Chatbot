@@ -7,7 +7,7 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const pdfParse = require("pdf-parse");
 
@@ -34,7 +34,10 @@ app.use((req, res, next) => {
 });
 
 // Initialize SQLite DB
-const db = new sqlite3.Database('./db.sqlite', (err) => {
+// Use in-memory DB on Vercel (read-only filesystem), file-based locally
+const IS_VERCEL = process.env.VERCEL === '1';
+const dbPath = IS_VERCEL ? ':memory:' : './db.sqlite';
+const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Failed to open DB:', err);
   } else {
@@ -587,7 +590,13 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running at http://localhost:${PORT}`);
-});
+// Only start listening when running locally (not on Vercel)
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`✅ Server running at http://localhost:${PORT}`);
+  });
+}
+
+// Export for Vercel serverless function
+module.exports = app;
