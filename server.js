@@ -7,12 +7,7 @@ const express = require("express");
 const path = require("path");
 const cors = require("cors");
 const multer = require("multer");
-let sqlite3;
-try {
-  sqlite3 = require('sqlite3').verbose();
-} catch (e) {
-  console.warn('sqlite3 native module not available (expected on Vercel):', e.message);
-}
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const pdfParse = require("pdf-parse");
@@ -39,83 +34,73 @@ app.use((req, res, next) => {
   next();
 });
 
-// Initialize SQLite DB (skip if sqlite3 native module is not available)
-let db = null;
-if (sqlite3) {
-  const IS_VERCEL = process.env.VERCEL === '1';
-  const dbPath = IS_VERCEL ? ':memory:' : './db.sqlite';
-  db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-      console.error('Failed to open DB:', err);
-      db = null;
-    } else {
-      console.log('SQLite DB connected');
-      // Create tables if they don't exist
-      db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL
-      );`);
-      db.run(`CREATE TABLE IF NOT EXISTS chats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        title TEXT,
-        document_text TEXT,
-        document_name TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-      );`, (err) => {
-        if (!err) {
-          db.run(`ALTER TABLE chats ADD COLUMN document_text TEXT;`, (err) => { });
-          db.run(`ALTER TABLE chats ADD COLUMN document_name TEXT;`, (err) => { });
-        }
-      });
-      db.run(`CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER NOT NULL,
-        sender TEXT NOT NULL,
-        content TEXT NOT NULL,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(chat_id) REFERENCES chats(id)
-      );`);
-    }
-  });
-} else {
-  console.warn('Running without database — guest mode only.');
-}
+// Initialize Supabase PostgreSQL connection Pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("localhost") ? false : {
+    rejectUnauthorized: false
+  }
+});
 
-// Promise wrappers for SQLite queries to make code async/await friendly
-const DB_UNAVAILABLE = new Error('Database not available. Please use guest mode.');
+// Initialize Supabase PostgreSQL DB Tables
+const initDb = async () => {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL
+    );`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS chats (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT,
+      document_text TEXT,
+      document_name TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      sender TEXT NOT NULL,
+      content TEXT NOT NULL,
+      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );`);
+    console.log('✅ Supabase PostgreSQL tables initialized');
+  } catch (err) {
+    console.error('❌ Failed to open Supabase DB:', err);
+  }
+};
+initDb();
 
-const dbRun = (query, params = []) => {
-  if (!db) return Promise.reject(DB_UNAVAILABLE);
-  return new Promise((resolve, reject) => {
-    db.run(query, params, function (err) {
-      if (err) reject(err);
-      else resolve(this);
-    });
-  });
+// Helper to convert SQLite style '?' queries to PostgreSQL '$1, $2' style
+const convertQuery = (query) => {
+  let index = 1;
+  return query.replace(/\?/g, () => `$${index++}`);
 };
 
-const dbGet = (query, params = []) => {
-  if (!db) return Promise.reject(DB_UNAVAILABLE);
-  return new Promise((resolve, reject) => {
-    db.get(query, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
+const dbRun = async (query, params = []) => {
+  let pgQuery = convertQuery(query);
+  const isInsert = pgQuery.trim().toUpperCase().startsWith('INSERT');
+  if (isInsert) {
+    pgQuery += ' RETURNING id';
+  }
+  const res = await pool.query(pgQuery, params);
+  return {
+    lastID: isInsert && res.rows[0] ? res.rows[0].id : null
+  };
 };
 
-const dbAll = (query, params = []) => {
-  if (!db) return Promise.reject(DB_UNAVAILABLE);
-  return new Promise((resolve, reject) => {
-    db.all(query, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
+const dbGet = async (query, params = []) => {
+  const pgQuery = convertQuery(query);
+  const res = await pool.query(pgQuery, params);
+  return res.rows[0] || null;
+};
+
+const dbAll = async (query, params = []) => {
+  const pgQuery = convertQuery(query);
+  const res = await pool.query(pgQuery, params);
+  return res.rows;
 };
 
 // Auth Guard Middleware
